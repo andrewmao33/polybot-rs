@@ -1,0 +1,28 @@
+[package]
+name = "polybot-rs"
+version = "0.1.0"
+edition = "2021"
+default-run = "polybot-rs"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+tokio-tungstenite = { version = "0.24", features = ["native-tls"] }
+tungstenite = "0.24"
+futures-util = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+simd-json = "0.13"
+reqwest = { version = "0.12", features = ["json"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+toml = "0.8"
+thiserror = "2"
+anyhow = "1"
+chrono = "0.4"
+polyfill-rs = { git = "https://github.com/floor-licker/polyfill-rs", rev = "17255926f9175e37fef1f5d8d072d11832a085a6" }
+rust_decimal = "1"
+rust_decimal_macros = "1"
+dotenvy = "0.15"
+polymarket-client-sdk = { version = "0.4.2", features = ["clob"] }
+alloy-primitives = "1.5.7"
+alloy = { version = "1", features = ["signers"] }
