@@ -16,7 +16,10 @@ impl Book {
     /// Check if we have valid data for both sides.
     /// Don't trade until this returns true.
     pub fn is_synced(&self) -> bool {
-        self.yes_ask.is_some() && self.no_ask.is_some()
+        self.yes_bid.is_some()
+            && self.yes_ask.is_some()
+            && self.no_bid.is_some()
+            && self.no_ask.is_some()
     }
 
     /// Update one side of the book.
@@ -84,10 +87,10 @@ mod tests {
         let mut book = Book::default();
 
         book.update(Side::Yes, 480, 490, 1000);
-        assert!(!book.is_synced()); // Missing NO
+        assert!(!book.is_synced()); // Missing NO bid/ask
 
         book.update(Side::No, 500, 510, 1001);
-        assert!(book.is_synced()); // Now have both
+        assert!(book.is_synced()); // Now have all 4: yes_bid, yes_ask, no_bid, no_ask
     }
 
     #[test]

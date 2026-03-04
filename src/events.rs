@@ -11,12 +11,20 @@ pub enum Event {
         ask: u16,
     },
 
+    // A trade happened on Polymarket (last_trade_price event)
+    // Used for flow estimator (k)
+    Trade {
+        side: Side,
+        price: u16,
+    },
+
     // One of our orders got filled
     OrderFill {
         order_id: String,
         side: Side,
         price: u16,
         size: f64,
+        is_maker: bool,
     },
 
     // Timer tick (every second)

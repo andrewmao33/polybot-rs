@@ -61,6 +61,18 @@ pub async fn get_current_5m_market() -> Result<MarketInfo> {
     fetch_market_by_slug(&slug).await
 }
 
+/// Fetch next BTC 5-minute market
+pub async fn get_next_5m_market() -> Result<MarketInfo> {
+    let epoch = floor_5m(now()) + 300;
+    let slug = format!("btc-updown-5m-{}", epoch);
+    fetch_market_by_slug(&slug).await
+}
+
+/// Parse start epoch from slug (e.g., "btc-updown-5m-1772242500" -> 1772242500)
+pub fn parse_start_epoch(slug: &str) -> Option<u64> {
+    slug.split('-').last()?.parse().ok()
+}
+
 /// Fetch market by slug from Gamma API
 async fn fetch_market_by_slug(slug: &str) -> Result<MarketInfo> {
     let url = format!("{}/markets/slug/{}", GAMMA_BASE, slug);

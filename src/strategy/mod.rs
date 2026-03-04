@@ -1,13 +1,19 @@
 mod actions;
+mod btc_guard;
+mod flow;
 mod pricing;
 mod sizing;
+mod variance;
 
 pub use actions::Action;
-pub use pricing::calc_max_bid;
+pub use btc_guard::{BtcGuard, BtcGuardConfig};
+pub use flow::FlowEstimator;
+pub use pricing::{calc_max_bid, AvellanedaStoikov, Quotes, P_MAX, P_MIN};
 pub use sizing::{calc_size, calc_size_with_limit, can_place, MarketDuration};
+pub use variance::VarianceEstimator;
 
 use crate::events::Side;
-use crate::state::{Book, Market, OrderTracker, Position};
+use crate::state::{OrderTracker, Position};
 use rust_decimal::Decimal;
 use std::collections::HashMap;
 
@@ -51,75 +57,105 @@ impl Default for StrategyConfig {
 ///
 /// Compares ideal ladder to current orders and returns actions to reconcile.
 ///
-/// TODO: Implement full reconciliation logic. Current stub just returns empty.
+/// # Arguments
+/// * `quotes` - A-S computed quotes (yes_bid, no_bid in probability space)
+/// * `p_mid` - Current mid probability (for should_quote check)
+/// * `position` - Current inventory
+/// * `orders` - Current standing orders
+/// * `time_remaining` - Seconds until market settlement
+/// * `config` - Strategy configuration
 ///
-/// # Flow
-/// 1. For each side (YES, NO):
-///    a. Calculate max_bid using pricing::calc_max_bid
-///    b. Calculate size using sizing::calc_size_with_limit
-///    c. Build ideal ladder (price → size)
-///    d. Compare to OrderTracker
-///    e. Generate Cancel actions for stale orders
-///    f. Generate Place actions for missing orders
-/// 2. Check rebalance condition
-/// 3. Return all actions
+/// # Returns
+/// Vec of actions to execute (Place, Cancel, CancelAll)
 pub fn reconcile(
-    _book: &Book,
-    _position: &Position,
-    _orders: &OrderTracker,
-    _market: &Market,
-    _config: &StrategyConfig,
+    quotes: &Quotes,
+    p_mid: f64,
+    position: &Position,
+    orders: &OrderTracker,
+    time_remaining: f64,
+    config: &StrategyConfig,
 ) -> Vec<Action> {
-    // TODO: Implement reconciliation logic
-    //
-    // Pseudocode:
-    //
-    // let mut actions = Vec::new();
-    // let time_remaining = market.time_remaining_secs(now_ms);
-    //
-    // for side in [Side::Yes, Side::No] {
-    //     // 1. Calculate ideal
-    //     let max_bid = calc_max_bid(side, book, config.margin_ticks);
-    //     let size = calc_size_with_limit(side, position, time_remaining, config.duration, config.max_position);
-    //
-    //     // 2. Build ideal ladder
-    //     let ideal = build_ladder(max_bid, size, config);
-    //
-    //     // 3. Cancel stale
-    //     for price in orders.prices(side) {
-    //         if !ideal.contains_key(&price) {
-    //             for order in orders.orders_at_price(side, price) {
-    //                 actions.push(Action::cancel(order.order_id.clone()));
-    //             }
-    //         }
-    //     }
-    //
-    //     // 4. Place missing
-    //     for (price, target_size) in &ideal {
-    //         let current = orders.total_size_at_price(side, *price);
-    //         if current < *target_size {
-    //             let diff = *target_size - current;
-    //             if diff >= config.min_order_size {
-    //                 actions.push(Action::place(side, *price, diff));
-    //             }
-    //         }
-    //     }
-    // }
-    //
-    // // 5. Check rebalance
-    // if let Some(take_action) = check_rebalance(position, book, config) {
-    //     actions.push(take_action);
-    // }
-    //
-    // actions
+    let mut actions = Vec::new();
 
-    Vec::new()
+    // Check if we should quote at all
+    if !Quotes::should_quote(p_mid) {
+        // Outside valid range - cancel all orders
+        if orders.total_count() > 0 {
+            actions.push(Action::CancelAll);
+        }
+        return actions;
+    }
+
+    // Convert A-S quotes to ticks
+    let yes_top_tick = AvellanedaStoikov::to_ticks(quotes.yes_bid);
+    let no_top_tick = AvellanedaStoikov::to_ticks(quotes.no_bid);
+
+    // Calculate size for each side
+    let time_remaining_secs = time_remaining as i64;
+    let yes_size = calc_size_with_limit(
+        Side::Yes,
+        position,
+        time_remaining_secs,
+        config.duration,
+        config.max_position,
+    );
+    let no_size = calc_size_with_limit(
+        Side::No,
+        position,
+        time_remaining_secs,
+        config.duration,
+        config.max_position,
+    );
+
+    // Build ideal ladders
+    let yes_ideal = build_ladder(yes_top_tick, yes_size, config);
+    let no_ideal = build_ladder(no_top_tick, no_size, config);
+
+    // Reconcile YES side
+    reconcile_side(Side::Yes, &yes_ideal, orders, config, &mut actions);
+
+    // Reconcile NO side
+    reconcile_side(Side::No, &no_ideal, orders, config, &mut actions);
+
+    actions
+}
+
+/// Reconcile a single side: cancel stale orders, place missing orders.
+fn reconcile_side(
+    side: Side,
+    ideal: &HashMap<u16, Decimal>,
+    orders: &OrderTracker,
+    config: &StrategyConfig,
+    actions: &mut Vec<Action>,
+) {
+    // 1. Cancel orders at prices not in ideal ladder
+    for price in orders.prices(side) {
+        if !ideal.contains_key(&price) {
+            for order in orders.orders_at_price(side, price) {
+                actions.push(Action::Cancel {
+                    order_id: order.order_id.clone(),
+                });
+            }
+        }
+    }
+
+    // 2. Place orders at ideal prices where we're short
+    for (&price, &target_size) in ideal {
+        let current_size = orders.total_size_at_price(side, price);
+        if current_size < target_size {
+            let needed = target_size - current_size;
+            if needed >= config.min_order_size {
+                actions.push(Action::Place {
+                    side,
+                    price,
+                    size: needed,
+                });
+            }
+        }
+    }
 }
 
 /// Build ideal ladder: {price: size, price-spacing: size, ...}
-///
-/// TODO: Finalize ladder logic.
-#[allow(dead_code)]
 fn build_ladder(
     top_price: u16,
     size: Decimal,
@@ -142,39 +178,6 @@ fn build_ladder(
     ladder
 }
 
-/// Check if rebalancing is needed and return Take action.
-///
-/// TODO: Finalize rebalance logic.
-#[allow(dead_code)]
-fn check_rebalance(
-    _position: &Position,
-    _book: &Book,
-    _config: &StrategyConfig,
-) -> Option<Action> {
-    // TODO: Implement rebalancing
-    //
-    // let imbalance = position.imbalance();
-    // if imbalance <= config.rebalance_threshold {
-    //     return None;
-    // }
-    //
-    // let light_side = if position.net_position() > Decimal::ZERO {
-    //     Side::No  // Heavy YES, need NO
-    // } else {
-    //     Side::Yes // Heavy NO, need YES
-    // };
-    //
-    // let take_size = (imbalance / dec!(3)).min(config.max_take_size);
-    //
-    // let max_price = book.best_ask(light_side)?;
-    // if max_price > 600 {  // Don't overpay
-    //     return None;
-    // }
-    //
-    // Some(Action::take(light_side, take_size, max_price))
-
-    None
-}
 
 #[cfg(test)]
 mod tests {
