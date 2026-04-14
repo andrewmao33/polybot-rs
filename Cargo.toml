@@ -23,6 +23,6 @@ polyfill-rs = { git = "https://github.com/floor-licker/polyfill-rs", rev = "1725
 rust_decimal = "1"
 rust_decimal_macros = "1"
 dotenvy = "0.15"
-polymarket-client-sdk = { version = "0.4.2", features = ["clob"] }
+polymarket-client-sdk = { version = "0.4.2", features = ["clob", "ctf", "data"] }
 alloy-primitives = "1.5.7"
-alloy = { version = "1", features = ["signers"] }
+alloy = { version = "1", features = ["signers", "providers"] }

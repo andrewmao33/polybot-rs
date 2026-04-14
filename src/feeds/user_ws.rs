@@ -72,8 +72,9 @@ impl UserFeed {
         Self { config }
     }
 
-    /// Spawns a task that connects and sends OrderFill events
-    pub fn spawn(self, tx: mpsc::Sender<Event>) {
+    /// Spawns a task that connects and sends OrderFill events.
+    /// Returns a JoinHandle that can be aborted on market switch.
+    pub fn spawn(self, tx: mpsc::Sender<Event>) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
             let mut reconnect_delay = 1u64;
             let max_reconnect_delay = 60u64;
@@ -132,7 +133,7 @@ impl UserFeed {
                 tokio::time::sleep(tokio::time::Duration::from_secs(reconnect_delay)).await;
                 reconnect_delay = (reconnect_delay * 2).min(max_reconnect_delay);
             }
-        });
+        })
     }
 
     async fn process_message(&self, text: &str, tx: &mpsc::Sender<Event>) {

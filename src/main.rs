@@ -21,10 +21,17 @@ mod strategy;
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use alloy::primitives::{B256, U256};
+use alloy::providers::ProviderBuilder;
+use alloy::signers::Signer as _;
+use alloy::signers::local::LocalSigner;
 use alloy_primitives::Address;
 use anyhow::Result;
 use polyfill_rs::orders::SigType;
 use polyfill_rs::ClobClient;
+use polymarket_client_sdk::ctf;
+use polymarket_client_sdk::ctf::types::MergePositionsRequest;
+use polymarket_client_sdk::types::address;
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 use std::str::FromStr;
@@ -53,7 +60,7 @@ const WARMUP_SECS: f64 = 15.0;     // Wait after market open
 const HALT_SECS: f64 = 15.0;       // Stop before market ends
 
 /// A-S Pricer
-const AS_GAMMA: f64 = 0.15;        // Risk aversion (higher = wider spreads)
+const AS_GAMMA: f64 = 0.05;        // Risk aversion (higher = wider spreads)
 const NO_CROSS_MARGIN: u16 = 10;   // Don't bid within 1c of market ask (stay maker)
 
 /// Variance Estimator
@@ -74,6 +81,15 @@ const ORDER_SIZE: i64 = 5;         // Shares per order
 
 /// Staleness detection
 const STALE_MS: i64 = 5000;        // Halt if no book update for 5s
+
+/// Fill cooldown: don't re-place on a side for this long after a fill
+const FILL_COOLDOWN_SECS: f64 = 1.0;
+
+/// Pair cost cap: max pair cost in ticks (990 = 99c = 1c margin)
+const MAX_PAIR_TICKS: u16 = 990;
+
+
+const USDC_ADDR: alloy::primitives::Address = address!("0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174");
 
 fn now_secs() -> f64 {
     SystemTime::now()
@@ -121,6 +137,16 @@ async fn main() -> Result<()> {
     let l1_client = ClobClient::with_l1_headers("https://clob.polymarket.com", &private_key, 137);
     let api_creds = l1_client.create_or_derive_api_key(None).await?;
     println!("API Key: {}...", &api_creds.api_key[..20.min(api_creds.api_key.len())]);
+
+    // Create CTF client for merge/redeem
+    let rpc_url = std::env::var("POLYGON_RPC_URL").unwrap_or_else(|_| "https://polygon-rpc.com".to_string());
+    let ctf_signer = LocalSigner::from_str(&private_key)?.with_chain_id(Some(137u64));
+    let ctf_provider = ProviderBuilder::new()
+        .wallet(ctf_signer)
+        .connect(&rpc_url)
+        .await?;
+    let ctf_client = ctf::Client::new(ctf_provider, 137)?;
+    println!("CTF client ready (RPC: {}...)", &rpc_url[..rpc_url.len().min(40)]);
 
     // Save credentials for UserFeed before moving to ClobClient
     let user_api_key = api_creds.api_key.clone();
@@ -192,6 +218,12 @@ async fn main() -> Result<()> {
     let mut poly_handle = poly_feed.spawn(tx.clone());
 
     // Spawn user WebSocket for fill notifications
+    // Save credentials for UserFeed restarts
+    let user_api_key_saved = user_api_key.clone();
+    let user_api_secret_saved = user_api_secret.clone();
+    let user_api_passphrase_saved = user_api_passphrase.clone();
+    let proxy_wallet_saved = proxy_wallet.clone();
+
     let user_feed_config = UserFeedConfig {
         api_key: user_api_key,
         api_secret: user_api_secret,
@@ -201,12 +233,14 @@ async fn main() -> Result<()> {
         no_token: market.no_token.clone(),
     };
     let user_feed = UserFeed::new(user_feed_config);
-    user_feed.spawn(tx.clone());
+    let mut user_handle = user_feed.spawn(tx.clone());
 
     // Create state
     let mut book = Book::default();
     let mut position = Position::default();
     let mut orders = OrderTracker::new();
+    let mut last_fill_time_yes: f64 = 0.0;
+    let mut last_fill_time_no: f64 = 0.0;
 
     // Create estimators (using constants from top of file)
     let mut var_est = VarianceEstimator::new(VAR_WINDOW, VAR_FLOOR);
@@ -272,6 +306,22 @@ async fn main() -> Result<()> {
                     session_stats.merge_window(&window_stats);
                     markets_completed += 1;
 
+                    // Merge paired shares to reclaim USDC
+                    if !log_only {
+                        let merge_qty = position.qty_yes.min(position.qty_no);
+                        if merge_qty > Decimal::ZERO {
+                            let merge_f64 = merge_qty.to_string().parse::<f64>().unwrap_or(0.0);
+                            let amount = U256::from((merge_f64 * 1_000_000.0) as u64);
+                            if let Ok(cid) = B256::from_str(&market.condition_id) {
+                                let merge_req = MergePositionsRequest::for_binary_market(USDC_ADDR, cid, amount);
+                                match ctf_client.merge_positions(&merge_req).await {
+                                    Ok(resp) => println!("[MERGE] {:.0} pairs → ${:.2} USDC (tx={})", merge_f64, merge_f64, resp.transaction_hash),
+                                    Err(e) => println!("[MERGE] Failed: {}", e),
+                                }
+                            }
+                        }
+                    }
+
                     // Check if we should quit
                     if let Some(max) = max_markets {
                         if markets_completed >= max {
@@ -295,6 +345,8 @@ async fn main() -> Result<()> {
                             btc_guard.reset();
                             position.reset();
                             orders.clear_all();
+                            last_fill_time_yes = 0.0;
+                            last_fill_time_no = 0.0;
                             book = Book::default();
                             window_stats = WindowStats::new();
 
@@ -308,6 +360,19 @@ async fn main() -> Result<()> {
                                 market.no_token.clone(),
                             );
                             poly_handle = new_feed.spawn(tx.clone());
+
+                            // Restart user feed with new tokens
+                            user_handle.abort();
+                            let new_user_config = UserFeedConfig {
+                                api_key: user_api_key_saved.clone(),
+                                api_secret: user_api_secret_saved.clone(),
+                                api_passphrase: user_api_passphrase_saved.clone(),
+                                maker_address: proxy_wallet_saved.clone(),
+                                yes_token: market.yes_token.clone(),
+                                no_token: market.no_token.clone(),
+                            };
+                            let new_user_feed = UserFeed::new(new_user_config);
+                            user_handle = new_user_feed.spawn(tx.clone());
 
                             logger.window_start(&market.slug);
                         }
@@ -366,9 +431,22 @@ async fn main() -> Result<()> {
 
                 let quotes = as_pricer.compute_quotes(mid, inventory, var, k, time_left);
 
-                // Convert to ticks and round to cents
-                let yes_target = round_to_cents(AvellanedaStoikov::to_ticks(quotes.yes_bid));
-                let no_target = round_to_cents(AvellanedaStoikov::to_ticks(quotes.no_bid));
+                // Convert to ticks and round to cents, clamp to stay maker
+                let no_ask = book.best_ask(Side::No).unwrap_or(1000);
+                let mut yes_target = round_to_cents(AvellanedaStoikov::to_ticks(quotes.yes_bid))
+                    .min(yes_ask.saturating_sub(NO_CROSS_MARGIN));
+                let mut no_target = round_to_cents(AvellanedaStoikov::to_ticks(quotes.no_bid))
+                    .min(no_ask.saturating_sub(NO_CROSS_MARGIN));
+
+                // Pair cost cap: don't bid more than would keep pair cost < MAX_PAIR_TICKS
+                if let Some(avg_no) = position.avg_price_no() {
+                    let cap = MAX_PAIR_TICKS.saturating_sub(avg_no.to_string().parse::<f64>().unwrap_or(0.0) as u16);
+                    yes_target = yes_target.min(round_to_cents(cap));
+                }
+                if let Some(avg_yes) = position.avg_price_yes() {
+                    let cap = MAX_PAIR_TICKS.saturating_sub(avg_yes.to_string().parse::<f64>().unwrap_or(0.0) as u16);
+                    no_target = no_target.min(round_to_cents(cap));
+                }
 
                 // Track that we're quoting this tick
                 window_stats.ticks_quoted += 1;
@@ -394,13 +472,17 @@ async fn main() -> Result<()> {
                 // Reconcile orders
                 let mut actions = Vec::new();
 
-                // YES side
+                // YES side: skip if in fill cooldown
                 let old_yes = yes_resting;
-                reconcile_side(Side::Yes, yes_target, &orders, &mut actions);
+                if now - last_fill_time_yes >= FILL_COOLDOWN_SECS {
+                    reconcile_side(Side::Yes, yes_target, &orders, &mut actions);
+                }
 
-                // NO side
+                // NO side: skip if in fill cooldown
                 let old_no = no_resting;
-                reconcile_side(Side::No, no_target, &orders, &mut actions);
+                if now - last_fill_time_no >= FILL_COOLDOWN_SECS {
+                    reconcile_side(Side::No, no_target, &orders, &mut actions);
+                }
 
                 // Log price replacements
                 if old_yes > 0 && yes_target != old_yes {
@@ -475,6 +557,12 @@ async fn main() -> Result<()> {
                     }
 
                     Event::OrderFill { order_id, side, price, size, is_maker } => {
+                        // Record fill time for cooldown
+                        match side {
+                            Side::Yes => last_fill_time_yes = now,
+                            Side::No => last_fill_time_no = now,
+                        }
+
                         // Update position
                         let size_dec = Decimal::try_from(size).unwrap_or(dec!(0));
                         position.apply_fill(side, price, size_dec);
@@ -556,6 +644,22 @@ async fn main() -> Result<()> {
         HALT_SECS,
     );
     session_stats.merge_window(&window_stats);
+
+    // Merge paired shares from final market
+    if !log_only {
+        let merge_qty = position.qty_yes.min(position.qty_no);
+        if merge_qty > Decimal::ZERO {
+            let merge_f64 = merge_qty.to_string().parse::<f64>().unwrap_or(0.0);
+            let amount = U256::from((merge_f64 * 1_000_000.0) as u64);
+            if let Ok(cid) = B256::from_str(&market.condition_id) {
+                let merge_req = MergePositionsRequest::for_binary_market(USDC_ADDR, cid, amount);
+                match ctf_client.merge_positions(&merge_req).await {
+                    Ok(resp) => println!("[MERGE] {:.0} pairs → ${:.2} USDC (tx={})", merge_f64, merge_f64, resp.transaction_hash),
+                    Err(e) => println!("[MERGE] Failed: {}", e),
+                }
+            }
+        }
+    }
 
     // Log session summary
     logger.session_summary(&session_stats);
