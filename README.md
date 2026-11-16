@@ -12,7 +12,7 @@ Quotes come from an Avellaneda-Stoikov pricer operating in logit space:
 - **Spread** widens with variance and tightens with order flow: `spread = gamma * var * T + (2/k) * ln(1 + gamma/k)`.
 - Bid/ask are converted back to probabilities; `yes_bid = p_bid`, `no_bid = 1 - p_ask`.
 
-`var` is a rolling logit-return variance, `k` is an EWMA of trade intensity. Order size tapers as the market approaches expiry. A BTC guard cancels all resting orders on sharp BTC moves (default: 0.3% in 2s) to avoid adverse selection.
+`var` is a rolling logit-return variance, `k` is an EWMA of trade intensity. Order size tapers as the market approaches expiry. A BTC guard cancels all resting orders on sharp BTC moves in either direction (default: 0.3% up or down within 2s) to avoid adverse selection.
 
 ## Architecture
 

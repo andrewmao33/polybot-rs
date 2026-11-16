@@ -1,39 +1,40 @@
-//! BTC crash detection for risk management.
+//! BTC price-shock detection for risk management.
 //!
-//! Monitors BTC price movements and triggers order cancellation
-//! when a significant drop is detected. This protects against
-//! being filled on stale quotes when BTC moves sharply.
+//! Monitors BTC price movements and triggers order cancellation when a
+//! sharp move in EITHER direction is detected. We always rest bids on both
+//! YES and NO, so a sharp drop leaves our YES bid stale and a sharp rise
+//! leaves our NO bid stale — both expose us to adverse selection.
 
 use std::collections::VecDeque;
 
-/// Configuration for crash detection.
+/// Configuration for shock detection.
 #[derive(Debug, Clone)]
 pub struct BtcGuardConfig {
-    /// Maximum price drop before triggering (e.g., 0.003 = 0.3%)
-    pub max_drop_pct: f64,
-    /// Time window to check for drops (seconds)
+    /// Maximum move (up or down) before triggering (e.g., 0.003 = 0.3%)
+    pub max_move_pct: f64,
+    /// Time window to check for moves (seconds)
     pub window_secs: f64,
-    /// Cooldown after crash before resuming (seconds)
+    /// Cooldown after a shock before resuming (seconds)
     pub cooldown_secs: f64,
 }
 
 impl Default for BtcGuardConfig {
     fn default() -> Self {
         Self {
-            max_drop_pct: 0.003,   // 0.3% drop triggers
-            window_secs: 2.0,      // Within 2 seconds
-            cooldown_secs: 5.0,    // 5 second cooldown after crash
+            max_move_pct: 0.003, // 0.3% move triggers
+            window_secs: 2.0,    // Within 2 seconds
+            cooldown_secs: 5.0,  // 5 second cooldown after shock
         }
     }
 }
 
-/// Tracks BTC prices and detects crashes.
+/// Tracks BTC prices and detects sharp moves.
 pub struct BtcGuard {
     config: BtcGuardConfig,
     /// Ring buffer of (timestamp, price)
     prices: VecDeque<(f64, f64)>,
-    /// Last crash timestamp (for cooldown)
-    last_crash_ts: Option<f64>,
+    /// Last shock timestamp (for cooldown)
+    last_shock_ts: Option<f64>,
     /// Current price
     current_price: f64,
 }
@@ -43,7 +44,7 @@ impl BtcGuard {
         Self {
             config,
             prices: VecDeque::with_capacity(100),
-            last_crash_ts: None,
+            last_shock_ts: None,
             current_price: 0.0,
         }
     }
@@ -51,14 +52,15 @@ impl BtcGuard {
     /// Update with new BTC price. Call on each Event::BtcPrice.
     ///
     /// # Returns
-    /// `true` if a crash is detected and orders should be cancelled.
+    /// `true` if a shock (sharp drop OR rise) is detected and orders should
+    /// be cancelled.
     pub fn update(&mut self, price: f64, now: f64) -> bool {
         self.current_price = price;
 
         // Check if we're in cooldown
-        if let Some(last_crash) = self.last_crash_ts {
-            if now - last_crash < self.config.cooldown_secs {
-                // Still in cooldown - don't trigger again but also don't clear
+        if let Some(last_shock) = self.last_shock_ts {
+            if now - last_shock < self.config.cooldown_secs {
+                // Still in cooldown - don't trigger again
                 return false;
             }
         }
@@ -76,17 +78,18 @@ impl BtcGuard {
             }
         }
 
-        // Check for crash: find max price in window and compare to current
-        let max_price = self
+        // Find the high and low of the window
+        let (min_price, max_price) = self
             .prices
             .iter()
-            .map(|(_, p)| *p)
-            .fold(0.0_f64, |a, b| a.max(b));
+            .fold((f64::INFINITY, 0.0_f64), |(lo, hi), &(_, p)| (lo.min(p), hi.max(p)));
 
-        if max_price > 0.0 {
+        if max_price > 0.0 && min_price > 0.0 {
+            // Drop from recent high (stale YES bids) or rise from recent low (stale NO bids)
             let drop_pct = (max_price - price) / max_price;
-            if drop_pct >= self.config.max_drop_pct {
-                self.last_crash_ts = Some(now);
+            let rise_pct = (price - min_price) / min_price;
+            if drop_pct >= self.config.max_move_pct || rise_pct >= self.config.max_move_pct {
+                self.last_shock_ts = Some(now);
                 return true;
             }
         }
@@ -96,8 +99,8 @@ impl BtcGuard {
 
     /// Check if we're currently in cooldown period.
     pub fn in_cooldown(&self, now: f64) -> bool {
-        if let Some(last_crash) = self.last_crash_ts {
-            now - last_crash < self.config.cooldown_secs
+        if let Some(last_shock) = self.last_shock_ts {
+            now - last_shock < self.config.cooldown_secs
         } else {
             false
         }
@@ -111,7 +114,7 @@ impl BtcGuard {
     /// Reset state (call on market switch).
     pub fn reset(&mut self) {
         self.prices.clear();
-        self.last_crash_ts = None;
+        self.last_shock_ts = None;
         self.current_price = 0.0;
     }
 }
@@ -120,56 +123,62 @@ impl BtcGuard {
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_no_crash_stable_price() {
-        let config = BtcGuardConfig {
-            max_drop_pct: 0.003,
+    fn cfg() -> BtcGuardConfig {
+        BtcGuardConfig {
+            max_move_pct: 0.003,
             window_secs: 2.0,
             cooldown_secs: 5.0,
-        };
-        let mut guard = BtcGuard::new(config);
+        }
+    }
 
-        // Stable price - no crash
+    #[test]
+    fn test_no_shock_stable_price() {
+        let mut guard = BtcGuard::new(cfg());
+
+        // Stable price - no shock
         assert!(!guard.update(50000.0, 0.0));
         assert!(!guard.update(50000.0, 0.5));
         assert!(!guard.update(50000.0, 1.0));
         assert!(!guard.update(49990.0, 1.5)); // 0.02% drop - OK
+        assert!(!guard.update(50010.0, 1.8)); // 0.04% rise from low - OK
     }
 
     #[test]
-    fn test_crash_detected() {
-        let config = BtcGuardConfig {
-            max_drop_pct: 0.003, // 0.3%
-            window_secs: 2.0,
-            cooldown_secs: 5.0,
-        };
-        let mut guard = BtcGuard::new(config);
+    fn test_drop_detected() {
+        let mut guard = BtcGuard::new(cfg());
 
-        // Price rises
+        // Price rises (0.2%, below threshold)
         assert!(!guard.update(50000.0, 0.0));
         assert!(!guard.update(50100.0, 0.5));
 
-        // Price drops 0.4% - crash!
-        // From 50100 to 49900 = -0.4%
+        // From 50100 to 49900 = -0.4% - shock!
         assert!(guard.update(49900.0, 1.0));
     }
 
     #[test]
+    fn test_rise_detected() {
+        let mut guard = BtcGuard::new(cfg());
+
+        // Price dips (0.2%, below threshold)
+        assert!(!guard.update(50000.0, 0.0));
+        assert!(!guard.update(49900.0, 0.5));
+
+        // From 49900 to 50100 = +0.4% - shock!
+        assert!(guard.update(50100.0, 1.0));
+        assert!(guard.in_cooldown(1.0));
+    }
+
+    #[test]
     fn test_cooldown_prevents_repeated_triggers() {
-        let config = BtcGuardConfig {
-            max_drop_pct: 0.003,
-            window_secs: 2.0,
-            cooldown_secs: 5.0,
-        };
-        let mut guard = BtcGuard::new(config);
+        let mut guard = BtcGuard::new(cfg());
 
-        // Trigger crash
+        // Trigger shock
         guard.update(50000.0, 0.0);
-        assert!(guard.update(49800.0, 1.0)); // -0.4% crash
+        assert!(guard.update(49800.0, 1.0)); // -0.4%
 
-        // Further drops during cooldown don't trigger again
+        // Further moves during cooldown don't trigger again
         assert!(!guard.update(49700.0, 2.0));
-        assert!(!guard.update(49600.0, 3.0));
+        assert!(!guard.update(50200.0, 3.0));
 
         // Still in cooldown at 5s
         assert!(guard.in_cooldown(5.0));
@@ -180,25 +189,19 @@ mod tests {
 
     #[test]
     fn test_old_prices_expire() {
-        let config = BtcGuardConfig {
-            max_drop_pct: 0.003,
-            window_secs: 2.0,
-            cooldown_secs: 5.0,
-        };
-        let mut guard = BtcGuard::new(config);
+        let mut guard = BtcGuard::new(cfg());
 
-        // High price at t=0
+        // High price at t=0, outside the 2s window by t=3
         assert!(!guard.update(50000.0, 0.0));
+        assert!(!guard.update(49800.0, 3.0)); // No shock - old high expired
 
-        // Price drops but outside window at t=3
-        // Window is 2s, so t=0 price should be gone
-        assert!(!guard.update(49800.0, 3.0)); // No crash - old high expired
+        // Low price at t=3, outside the window by t=6
+        assert!(!guard.update(50000.0, 6.0)); // No shock - old low expired
     }
 
     #[test]
     fn test_reset() {
-        let config = BtcGuardConfig::default();
-        let mut guard = BtcGuard::new(config);
+        let mut guard = BtcGuard::new(BtcGuardConfig::default());
 
         guard.update(50000.0, 0.0);
         guard.update(49800.0, 1.0);

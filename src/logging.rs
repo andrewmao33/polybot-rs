@@ -393,7 +393,7 @@ impl Logger {
 
         // Stdout
         println!(
-            "[{}] BTC CRASH {} | cancelled {} orders",
+            "[{}] BTC SHOCK {} | cancelled {} orders",
             self.timestamp_str(), reason, cancelled_count
         );
     }

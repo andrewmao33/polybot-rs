@@ -72,9 +72,9 @@ const FLOW_WINDOW_SECS: f64 = 30.0; // Trade counting window
 const FLOW_K_FLOOR: f64 = 0.1;      // Minimum k (trades/sec)
 
 /// BTC Guard
-const BTC_MAX_DROP_PCT: f64 = 0.003;  // 0.3% triggers cancel
+const BTC_MAX_MOVE_PCT: f64 = 0.003;  // 0.3% move (up or down) triggers cancel
 const BTC_WINDOW_SECS: f64 = 2.0;     // Drop detection window
-const BTC_COOLDOWN_SECS: f64 = 5.0;   // Pause after crash
+const BTC_COOLDOWN_SECS: f64 = 5.0;   // Pause after shock
 
 /// Order size
 const ORDER_SIZE: i64 = 5;         // Shares per order
@@ -246,7 +246,7 @@ async fn main() -> Result<()> {
     let mut var_est = VarianceEstimator::new(VAR_WINDOW, VAR_FLOOR);
     let mut flow_est = FlowEstimator::new(FLOW_WINDOW_SECS, FLOW_K_FLOOR);
     let mut btc_guard = BtcGuard::new(BtcGuardConfig {
-        max_drop_pct: BTC_MAX_DROP_PCT,
+        max_move_pct: BTC_MAX_MOVE_PCT,
         window_secs: BTC_WINDOW_SECS,
         cooldown_secs: BTC_COOLDOWN_SECS,
     });
@@ -528,7 +528,7 @@ async fn main() -> Result<()> {
                     Event::BtcPrice { price } => {
                         let old_price = last_btc_price;
                         last_btc_price = price;
-                        // Check for crash
+                        // Check for sharp BTC move (either direction)
                         if btc_guard.update(price, now) {
                             let cancelled = orders.total_count();
                             window_stats.toxic_cancels += 1;
