@@ -15,8 +15,6 @@ simd-json = "0.13"
 reqwest = { version = "0.12", features = ["json"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-toml = "0.8"
-thiserror = "2"
 anyhow = "1"
 chrono = "0.4"
 polyfill-rs = { git = "https://github.com/floor-licker/polyfill-rs", rev = "17255926f9175e37fef1f5d8d072d11832a085a6" }

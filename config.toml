@@ -1,6 +1,0 @@
-[credentials]
-private_key = ""
-proxy_wallet = ""
-
-[general]
-log_level = "info"

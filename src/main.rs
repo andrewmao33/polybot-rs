@@ -11,7 +11,6 @@
 //!     POLY_PROXY_WALLET=0x...
 
 mod api;
-mod config;
 mod events;
 mod executor;
 mod feeds;
