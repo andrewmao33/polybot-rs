@@ -159,23 +159,42 @@ impl Executor {
     }
 
     /// Cancel all orders.
+    ///
+    /// Only removes an order from the tracker once the exchange has answered the
+    /// cancel request. An `Ok` response means the order is no longer live (either
+    /// cancelled now, or already filled/cancelled and reported in `not_canceled`).
+    /// An `Err` means the request itself failed (network, 5xx, auth), so the order
+    /// may still be resting — we keep tracking it so the next tick retries the cancel
+    /// instead of forgetting about a live order.
     async fn execute_cancel_all(&self, orders: &mut OrderTracker) -> Result<()> {
-        // Cancel YES orders
-        for order_id in orders.all_order_ids(Side::Yes) {
-            if let Err(e) = self.client.cancel(order_id).await {
-                warn!("Failed to cancel {}: {}", &order_id[..20.min(order_id.len())], e);
+        let mut failed = 0usize;
+
+        for side in [Side::Yes, Side::No] {
+            // Collect owned IDs first: we mutate the tracker inside the loop.
+            let ids: Vec<String> = orders
+                .all_order_ids(side)
+                .into_iter()
+                .map(String::from)
+                .collect();
+
+            for order_id in ids {
+                match self.client.cancel(&order_id).await {
+                    Ok(_) => {
+                        orders.remove_by_id(side, &order_id);
+                    }
+                    Err(e) => {
+                        failed += 1;
+                        warn!("Failed to cancel {}: {}", &order_id[..20.min(order_id.len())], e);
+                    }
+                }
             }
         }
 
-        // Cancel NO orders
-        for order_id in orders.all_order_ids(Side::No) {
-            if let Err(e) = self.client.cancel(order_id).await {
-                warn!("Failed to cancel {}: {}", &order_id[..20.min(order_id.len())], e);
-            }
+        if failed == 0 {
+            info!("Cancelled all orders");
+        } else {
+            warn!("Cancel-all incomplete: {} order(s) still tracked, will retry", failed);
         }
-
-        orders.clear_all();
-        info!("Cancelled all orders");
         Ok(())
     }
 

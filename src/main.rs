@@ -107,6 +107,15 @@ fn round_to_cents(ticks: u16) -> u16 {
 async fn main() -> Result<()> {
     dotenvy::dotenv().ok();
 
+    // Show executor logs (order placements, failed orders/cancels).
+    // Override verbosity with RUST_LOG, e.g. RUST_LOG=warn.
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
+        .init();
+
     // Parse args
     let args: Vec<String> = std::env::args().collect();
     let log_only = args.iter().any(|a| a == "--log-only" || a == "--dry-run");
@@ -257,6 +266,8 @@ async fn main() -> Result<()> {
     // 50ms tick interval
     let mut tick_interval = interval(Duration::from_millis(TICK_MS));
     let mut last_btc_price: f64 = 0.0;
+    // Set once the finished window's stats/merge have run, cleared on market switch
+    let mut window_closed = false;
 
     println!("Starting event loop... (Ctrl+C to quit)\n");
     logger.window_start(&market.slug);
@@ -285,48 +296,55 @@ async fn main() -> Result<()> {
                         continue;
                     }
 
-                    // End current window
-                    window_stats.finalize();
-                    let yes_shares = position.qty_yes.to_string().parse::<f64>().unwrap_or(0.0);
-                    let yes_avg = position.avg_price_yes().map(|p| p.to_string().parse::<f64>().unwrap_or(0.0) / 10.0).unwrap_or(0.0);
-                    let no_shares = position.qty_no.to_string().parse::<f64>().unwrap_or(0.0);
-                    let no_avg = position.avg_price_no().map(|p| p.to_string().parse::<f64>().unwrap_or(0.0) / 10.0).unwrap_or(0.0);
-                    let min_pnl = position.min_pnl_usd().to_string().parse::<f64>().unwrap_or(0.0);
-                    logger.window_end(
-                        &market.slug,
-                        &window_stats,
-                        yes_shares,
-                        yes_avg,
-                        no_shares,
-                        no_avg,
-                        min_pnl,
-                        AS_GAMMA,
-                        HALT_SECS,
-                    );
-                    session_stats.merge_window(&window_stats);
-                    markets_completed += 1;
+                    // Close out the finished window exactly once. If fetching the next
+                    // market fails below, we retry on later ticks without re-logging
+                    // stats, re-merging, or double-counting markets_completed.
+                    if !window_closed {
+                        window_closed = true;
 
-                    // Merge paired shares to reclaim USDC
-                    if !log_only {
-                        let merge_qty = position.qty_yes.min(position.qty_no);
-                        if merge_qty > Decimal::ZERO {
-                            let merge_f64 = merge_qty.to_string().parse::<f64>().unwrap_or(0.0);
-                            let amount = U256::from((merge_f64 * 1_000_000.0) as u64);
-                            if let Ok(cid) = B256::from_str(&market.condition_id) {
-                                let merge_req = MergePositionsRequest::for_binary_market(USDC_ADDR, cid, amount);
-                                match ctf_client.merge_positions(&merge_req).await {
-                                    Ok(resp) => println!("[MERGE] {:.0} pairs → ${:.2} USDC (tx={})", merge_f64, merge_f64, resp.transaction_hash),
-                                    Err(e) => println!("[MERGE] Failed: {}", e),
+                        // End current window
+                        window_stats.finalize();
+                        let yes_shares = position.qty_yes.to_string().parse::<f64>().unwrap_or(0.0);
+                        let yes_avg = position.avg_price_yes().map(|p| p.to_string().parse::<f64>().unwrap_or(0.0) / 10.0).unwrap_or(0.0);
+                        let no_shares = position.qty_no.to_string().parse::<f64>().unwrap_or(0.0);
+                        let no_avg = position.avg_price_no().map(|p| p.to_string().parse::<f64>().unwrap_or(0.0) / 10.0).unwrap_or(0.0);
+                        let min_pnl = position.min_pnl_usd().to_string().parse::<f64>().unwrap_or(0.0);
+                        logger.window_end(
+                            &market.slug,
+                            &window_stats,
+                            yes_shares,
+                            yes_avg,
+                            no_shares,
+                            no_avg,
+                            min_pnl,
+                            AS_GAMMA,
+                            HALT_SECS,
+                        );
+                        session_stats.merge_window(&window_stats);
+                        markets_completed += 1;
+
+                        // Merge paired shares to reclaim USDC
+                        if !log_only {
+                            let merge_qty = position.qty_yes.min(position.qty_no);
+                            if merge_qty > Decimal::ZERO {
+                                let merge_f64 = merge_qty.to_string().parse::<f64>().unwrap_or(0.0);
+                                let amount = U256::from((merge_f64 * 1_000_000.0) as u64);
+                                if let Ok(cid) = B256::from_str(&market.condition_id) {
+                                    let merge_req = MergePositionsRequest::for_binary_market(USDC_ADDR, cid, amount);
+                                    match ctf_client.merge_positions(&merge_req).await {
+                                        Ok(resp) => println!("[MERGE] {:.0} pairs → ${:.2} USDC (tx={})", merge_f64, merge_f64, resp.transaction_hash),
+                                        Err(e) => println!("[MERGE] Failed: {}", e),
+                                    }
                                 }
                             }
                         }
-                    }
 
-                    // Check if we should quit
-                    if let Some(max) = max_markets {
-                        if markets_completed >= max {
-                            println!("\n>>> Completed {} market(s), shutting down...", markets_completed);
-                            break;
+                        // Check if we should quit
+                        if let Some(max) = max_markets {
+                            if markets_completed >= max {
+                                println!("\n>>> Completed {} market(s), shutting down...", markets_completed);
+                                break;
+                            }
                         }
                     }
 
@@ -334,6 +352,7 @@ async fn main() -> Result<()> {
                     match gamma::get_current_5m_market().await {
                         Ok(new_market) => {
                             market = new_market;
+                            window_closed = false;
                             market_start = gamma::parse_start_epoch(&market.slug)
                                 .map(|e| e as f64)
                                 .unwrap_or(now_secs());
@@ -625,37 +644,40 @@ async fn main() -> Result<()> {
         }
     }
 
-    // Finalize current window and merge into session
-    window_stats.finalize();
-    let yes_shares = position.qty_yes.to_string().parse::<f64>().unwrap_or(0.0);
-    let yes_avg = position.avg_price_yes().map(|p| p.to_string().parse::<f64>().unwrap_or(0.0) / 10.0).unwrap_or(0.0);
-    let no_shares = position.qty_no.to_string().parse::<f64>().unwrap_or(0.0);
-    let no_avg = position.avg_price_no().map(|p| p.to_string().parse::<f64>().unwrap_or(0.0) / 10.0).unwrap_or(0.0);
-    let min_pnl = position.min_pnl_usd().to_string().parse::<f64>().unwrap_or(0.0);
-    logger.window_end(
-        &market.slug,
-        &window_stats,
-        yes_shares,
-        yes_avg,
-        no_shares,
-        no_avg,
-        min_pnl,
-        AS_GAMMA,
-        HALT_SECS,
-    );
-    session_stats.merge_window(&window_stats);
+    // Finalize the current window on shutdown (Ctrl+C), unless the market-end
+    // path already closed it (e.g. --markets N exit) — avoids double stats/merge.
+    if !window_closed {
+        window_stats.finalize();
+        let yes_shares = position.qty_yes.to_string().parse::<f64>().unwrap_or(0.0);
+        let yes_avg = position.avg_price_yes().map(|p| p.to_string().parse::<f64>().unwrap_or(0.0) / 10.0).unwrap_or(0.0);
+        let no_shares = position.qty_no.to_string().parse::<f64>().unwrap_or(0.0);
+        let no_avg = position.avg_price_no().map(|p| p.to_string().parse::<f64>().unwrap_or(0.0) / 10.0).unwrap_or(0.0);
+        let min_pnl = position.min_pnl_usd().to_string().parse::<f64>().unwrap_or(0.0);
+        logger.window_end(
+            &market.slug,
+            &window_stats,
+            yes_shares,
+            yes_avg,
+            no_shares,
+            no_avg,
+            min_pnl,
+            AS_GAMMA,
+            HALT_SECS,
+        );
+        session_stats.merge_window(&window_stats);
 
-    // Merge paired shares from final market
-    if !log_only {
-        let merge_qty = position.qty_yes.min(position.qty_no);
-        if merge_qty > Decimal::ZERO {
-            let merge_f64 = merge_qty.to_string().parse::<f64>().unwrap_or(0.0);
-            let amount = U256::from((merge_f64 * 1_000_000.0) as u64);
-            if let Ok(cid) = B256::from_str(&market.condition_id) {
-                let merge_req = MergePositionsRequest::for_binary_market(USDC_ADDR, cid, amount);
-                match ctf_client.merge_positions(&merge_req).await {
-                    Ok(resp) => println!("[MERGE] {:.0} pairs → ${:.2} USDC (tx={})", merge_f64, merge_f64, resp.transaction_hash),
-                    Err(e) => println!("[MERGE] Failed: {}", e),
+        // Merge paired shares from final market
+        if !log_only {
+            let merge_qty = position.qty_yes.min(position.qty_no);
+            if merge_qty > Decimal::ZERO {
+                let merge_f64 = merge_qty.to_string().parse::<f64>().unwrap_or(0.0);
+                let amount = U256::from((merge_f64 * 1_000_000.0) as u64);
+                if let Ok(cid) = B256::from_str(&market.condition_id) {
+                    let merge_req = MergePositionsRequest::for_binary_market(USDC_ADDR, cid, amount);
+                    match ctf_client.merge_positions(&merge_req).await {
+                        Ok(resp) => println!("[MERGE] {:.0} pairs → ${:.2} USDC (tx={})", merge_f64, merge_f64, resp.transaction_hash),
+                        Err(e) => println!("[MERGE] Failed: {}", e),
+                    }
                 }
             }
         }
